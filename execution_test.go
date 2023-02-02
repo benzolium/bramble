@@ -315,6 +315,47 @@ func TestFederatedQueryFragmentSpreads(t *testing.T) {
 			}
 		}),
 	}
+	serviceC := testService{
+		schema: `
+		directive @boundary on OBJECT | FIELD_DEFINITION
+		type Foo @boundary {
+			id: ID!
+		}
+
+		type Bar @boundary {
+			id: ID!
+		}
+
+		union FooOrBar = Foo | Bar
+
+		type Baz @boundary {
+			id: ID!
+			value: FooOrBar
+		}
+
+		type Query {
+			baz(id: ID!): Baz!
+			foo(id: ID!): Foo!
+			bar(id: ID!): Bar!
+		}`,
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte(`
+			{
+				"data": {
+					"baz": {
+						"_bramble_id": "BAZ1",
+						"_bramble__typename": "Baz",
+						"id": "1",
+						"value": {
+							"_bramble_id": "BAR1",
+							"_bramble__typename": "BAR",
+							"id": "1",
+						}
+					}
+				}
+			}`))
+		}),
+	}
 
 	t.Run("with inline fragment spread", func(t *testing.T) {
 		f := &queryExecutionFixture{
@@ -647,6 +688,37 @@ func TestFederatedQueryFragmentSpreads(t *testing.T) {
 						"name": "foo"
 					}
 				]
+			}`,
+		}
+
+		f.checkSuccess(t)
+	})
+	t.Run("with nested abstract fragment spreads null return", func(t *testing.T) {
+		f := &queryExecutionFixture{
+			services: []testService{serviceC},
+			query: `
+			query Foo {
+				baz(id: "BAZ1") {
+					id
+					value {
+						...BazValueFragment
+					}
+				}
+			}
+
+			fragment FooFragment on Foo {
+				id
+			}
+
+			fragment BazValueFragment on FooOrBar {
+				...FooFragment
+			}`,
+			expected: `
+			{
+				"baz": {
+					"id": "1",
+					"value": null
+				}
 			}`,
 		}
 
