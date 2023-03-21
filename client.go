@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/99designs/gqlgen/graphql"
 	"github.com/vektah/gqlparser/v2/ast"
 )
 
@@ -92,9 +94,76 @@ func WithUserAgent(userAgent string) ClientOpt {
 // Request executes a GraphQL request.
 func (c *GraphQLClient) Request(ctx context.Context, url string, request *Request, out interface{}) error {
 	var buf bytes.Buffer
-	err := json.NewEncoder(&buf).Encode(request)
-	if err != nil {
-		return fmt.Errorf("unable to encode request body: %w", err)
+	contentType := "application/json; charset=utf-8"
+	if ct := request.Headers.Get("Content-Type"); strings.Contains(ct, "multipart") {
+		index := 0
+		fileMap := map[string][]string{}
+		files := map[string]graphql.Upload{}
+		for rootVarName, rootVar := range request.Variables {
+			switch v := rootVar.(type) {
+			case graphql.Upload:
+				request.Variables[rootVarName] = nil
+				fileIndex := fmt.Sprintf("file%d", index)
+				fileMap[fileIndex] = []string{fmt.Sprintf("variables.%s", rootVarName)}
+				index += 1
+				files[fileIndex] = v
+			case *graphql.Upload:
+				request.Variables[rootVarName] = nil
+				fileIndex := fmt.Sprintf("file%d", index)
+				fileMap[fileIndex] = []string{fmt.Sprintf("variables.%s", rootVarName)}
+				index += 1
+				files[fileIndex] = *v
+			case map[string]interface{}:
+				for firstLevelVarName, firstLevelVar := range v {
+					switch fv := firstLevelVar.(type) {
+					case graphql.Upload:
+						v[firstLevelVarName] = nil
+						fileIndex := fmt.Sprintf("file%d", index)
+						fileMap[fileIndex] = []string{
+							fmt.Sprintf(
+								"variables.%s.%s",
+								rootVarName,
+								firstLevelVarName,
+							),
+						}
+						index += 1
+						files[fileIndex] = fv
+					case *graphql.Upload:
+						v[firstLevelVarName] = nil
+						fileIndex := fmt.Sprintf("file%d", index)
+						fileMap[fileIndex] = []string{
+							fmt.Sprintf(
+								"variables.%s.%s",
+								rootVarName,
+								firstLevelVarName,
+							),
+						}
+						index += 1
+						files[fileIndex] = *fv
+					}
+				}
+			}
+		}
+		var fw io.Writer
+		mpw := multipart.NewWriter(&buf)
+		fw,_= mpw.CreateFormField("operations")
+		input, _ := json.Marshal(request)
+		fw.Write(input)
+		fw,_= mpw.CreateFormField("map")
+		for fileIndex, path := range fileMap {
+			fw.Write([]byte(fmt.Sprintf(
+				"{\"%s\": [\"%s\"]}", fileIndex, path[0],
+			)))
+			fw, _ = mpw.CreateFormFile(fileIndex, files[fileIndex].Filename)
+			io.Copy(fw, files[fileIndex].File)
+		}
+		mpw.Close()
+		contentType = mpw.FormDataContentType()
+	} else {
+		err := json.NewEncoder(&buf).Encode(request)
+		if err != nil {
+			return fmt.Errorf("unable to encode request body: %w", err)
+		}
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
@@ -106,7 +175,7 @@ func (c *GraphQLClient) Request(ctx context.Context, url string, request *Reques
 		httpReq.Header = request.Headers.Clone()
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json; charset=utf-8")
+	httpReq.Header.Set("Content-Type", contentType)
 	httpReq.Header.Set("Accept", "application/json; charset=utf-8")
 
 	if c.UserAgent != "" {
