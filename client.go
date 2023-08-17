@@ -10,10 +10,12 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/99designs/gqlgen/graphql"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vektah/gqlparser/v2/ast"
 )
 
@@ -184,6 +186,11 @@ func (c *GraphQLClient) Request(ctx context.Context, url string, request *Reques
 
 	res, err := c.HTTPClient.Do(httpReq)
 	if err != nil {
+		if os.IsTimeout(err) {
+			promServiceTimeoutErrorCounter.With(prometheus.Labels{
+				"service": url,
+			}).Inc()
+		}
 		return fmt.Errorf("error during request: %w", err)
 	}
 	defer res.Body.Close()
