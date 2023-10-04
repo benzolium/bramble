@@ -53,7 +53,8 @@ func (e *event) finish() {
 		log.WithFields(log.Fields{
 			"timestamp": e.timestamp.Format(time.RFC3339Nano),
 			"duration":  time.Since(e.timestamp).String(),
-		}).WithFields(log.Fields(e.fields)).Debug(e.name)
+		}).Info(e.name)
+		log.WithFields(log.Fields(e.fields)).Debug(e.name)
 	})
 }
 
