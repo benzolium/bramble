@@ -11,6 +11,12 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/vektah/gqlparser/v2/ast"
 	"github.com/vektah/gqlparser/v2/gqlerror"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
 )
 
 func NewExecutableSchema(plugins []Plugin, maxRequestsPerQuery int64, client *GraphQLClient, services ...*Service) *ExecutableSchema {
@@ -29,6 +35,7 @@ func NewExecutableSchema(plugins []Plugin, maxRequestsPerQuery int64, client *Gr
 
 		GraphqlClient:       client,
 		plugins:             plugins,
+		tracer:              otel.GetTracerProvider().Tracer(instrumentationName),
 		MaxRequestsPerQuery: maxRequestsPerQuery,
 	}
 }
@@ -43,29 +50,39 @@ type ExecutableSchema struct {
 	GraphqlClient       *GraphQLClient
 	MaxRequestsPerQuery int64
 
+	tracer  trace.Tracer
 	mutex   sync.RWMutex
 	plugins []Plugin
 }
 
 // UpdateServiceList replaces the list of services with the provided one and
 // update the schema.
-func (s *ExecutableSchema) UpdateServiceList(services []string) error {
+func (s *ExecutableSchema) UpdateServiceList(ctx context.Context, services []string) error {
+	ctx, span := s.tracer.Start(ctx, "Federated Services Update",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.StringSlice("graphql.federation.services", services),
+		),
+	)
+
+	defer span.End()
+
 	newServices := make(map[string]*Service)
 	for _, svcURL := range services {
 		if svc, ok := s.Services[svcURL]; ok {
 			newServices[svcURL] = svc
 		} else {
-			newServices[svcURL] = NewService(svcURL)
+			newServices[svcURL] = NewService(svcURL, WithHTTPClient(s.GraphqlClient.HTTPClient))
 		}
 	}
 	s.Services = newServices
 
-	return s.UpdateSchema(true)
+	return s.UpdateSchema(ctx, true)
 }
 
 // UpdateSchema updates the schema from every service and then update the merged
 // schema.
-func (s *ExecutableSchema) UpdateSchema(forceRebuild bool) error {
+func (s *ExecutableSchema) UpdateSchema(ctx context.Context, forceRebuild bool) error {
 	var services []*Service
 	var schemas []*ast.Schema
 	var updatedServices []string
@@ -79,31 +96,48 @@ func (s *ExecutableSchema) UpdateSchema(forceRebuild bool) error {
 		}
 	}()
 
-	for url, s := range s.Services {
-		logger := log.WithField("url", url)
-		updated, err := s.Update()
-		if err != nil {
-			promServiceUpdateErrorCounter.WithLabelValues(s.ServiceURL).Inc()
-			promServiceUpdateErrorGauge.WithLabelValues(s.ServiceURL).Set(1)
-			invalidSchema, forceRebuild = true, true
-			logger.WithError(err).Error("unable to update service")
-			// Ignore this service in this update
-			continue
-		}
-		promServiceUpdateErrorGauge.WithLabelValues(s.ServiceURL).Set(0)
-		logger = log.WithFields(log.Fields{
-			"version": s.Version,
-			"service": s.Name,
+	// Only fetch at most 64 services in parallel
+	var mutex sync.Mutex
+
+	group := errgroup.Group{}
+	// Avoid fetching more than 64 servides in parallel,
+	// as high concurrency can actually hurt performance
+	group.SetLimit(64)
+	for url_, s_ := range s.Services {
+		url := url_
+		s := s_
+		group.Go(func() error {
+			logger := log.WithField("url", url)
+			updated, err := s.Update(ctx)
+			if err != nil {
+				promServiceUpdateErrorCounter.WithLabelValues(s.ServiceURL).Inc()
+				promServiceUpdateErrorGauge.WithLabelValues(s.ServiceURL).Set(1)
+				invalidSchema, forceRebuild = true, true
+				logger.WithError(err).Error("unable to update service")
+				// Ignore this service in this update
+				return nil
+			}
+			promServiceUpdateErrorGauge.WithLabelValues(s.ServiceURL).Set(0)
+			logger = log.WithFields(log.Fields{
+				"version": s.Version,
+				"service": s.Name,
+			})
+
+			mutex.Lock()
+			defer mutex.Unlock()
+			if updated {
+				logger.Info("service was updated")
+				updatedServices = append(updatedServices, s.Name)
+			}
+
+			services = append(services, s)
+			schemas = append(schemas, s.Schema)
+
+			return nil
 		})
-
-		if updated {
-			logger.Info("service was updated")
-			updatedServices = append(updatedServices, s.Name)
-		}
-
-		services = append(services, s)
-		schemas = append(schemas, s.Schema)
 	}
+
+	group.Wait()
 
 	if len(updatedServices) > 0 || forceRebuild {
 		log.Info("rebuilding merged schema")
@@ -138,6 +172,26 @@ func (s *ExecutableSchema) ExecuteQuery(ctx context.Context) *graphql.Response {
 	operation := operationCtx.Operation
 	variables := operationCtx.Variables
 
+	ctx, span := s.tracer.Start(ctx, "Federated GraphQL Query",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			semconv.GraphqlOperationTypeKey.String(string(operation.Operation)),
+			semconv.GraphqlOperationName(operationCtx.OperationName),
+			semconv.GraphqlDocument(operationCtx.RawQuery),
+		),
+	)
+
+	defer span.End()
+
+	traceErr := func(err error) {
+		if err == nil {
+			return
+		}
+
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+
 	for _, plugin := range s.plugins {
 		plugin.InterceptRequest(ctx, operation.Name, operationCtx.RawQuery, variables)
 	}
@@ -167,8 +221,8 @@ func (s *ExecutableSchema) ExecuteQuery(ctx context.Context) *graphql.Response {
 		IsBoundary: s.IsBoundary,
 		Services:   s.Services,
 	})
-
 	if err != nil {
+		traceErr(err)
 		return s.interceptResponse(ctx, operation.Name, operationCtx.RawQuery, variables, graphql.ErrorResponse(ctx, err.Error()))
 	}
 
@@ -196,8 +250,10 @@ func (s *ExecutableSchema) ExecuteQuery(ctx context.Context) *graphql.Response {
 	executionStart := time.Now()
 
 	qe := newQueryExecution(ctx, operationCtx.OperationName, s.GraphqlClient, filteredSchema, s.BoundaryQueries, int32(s.MaxRequestsPerQuery))
+
 	results, executeErrs := qe.Execute(plan)
 	if len(executeErrs) > 0 {
+		traceErr(executeErrs)
 		return s.interceptResponse(ctx, operation.Name, operationCtx.RawQuery, variables, &graphql.Response{
 			Errors: executeErrs,
 		})
@@ -219,13 +275,16 @@ func (s *ExecutableSchema) ExecuteQuery(ctx context.Context) *graphql.Response {
 		}
 	}
 
-	timings["execution"] = time.Since(executionStart).Round(time.Millisecond).String()
+	timings["execution"] = time.Since(executionStart).String()
 
 	mergeStart := time.Now()
 	mergedResult, err := mergeExecutionResults(results)
 	if err != nil {
 		errs = append(errs, &gqlerror.Error{Message: err.Error()})
+
+		traceErr(errs)
 		AddField(ctx, "errors", errs)
+
 		return s.interceptResponse(ctx, operation.Name, operationCtx.RawQuery, variables, &graphql.Response{
 			Errors: errs,
 		})
@@ -236,20 +295,24 @@ func (s *ExecutableSchema) ExecuteQuery(ctx context.Context) *graphql.Response {
 		mergedResult = nil
 	} else if err != nil {
 		errs = append(errs, &gqlerror.Error{Message: err.Error()})
+
+		traceErr(errs)
 		AddField(ctx, "errors", errs)
+
 		return s.interceptResponse(ctx, operation.Name, operationCtx.RawQuery, variables, &graphql.Response{
 			Errors: errs,
 		})
 	}
 
 	errs = append(errs, bubbleErrs...)
-	timings["merge"] = time.Since(mergeStart).Round(time.Millisecond).String()
+	timings["merge"] = time.Since(mergeStart).String()
 
 	formattingStart := time.Now()
 	formattedResponse := formatResponseData(filteredSchema, operation.SelectionSet, mergedResult)
-	timings["format"] = time.Since(formattingStart).Round(time.Millisecond).String()
+	timings["format"] = time.Since(formattingStart).String()
 
 	if len(errs) > 0 {
+		traceErr(errs)
 		AddField(ctx, "errors", errs)
 	}
 
@@ -593,7 +656,7 @@ func jsonMapToInterfaceMap(m map[string]json.RawMessage) map[string]interface{} 
 	return res
 }
 
-// mergeMaps merge dst into src, unmarshalling json.RawMessages when necessary
+// mergeMaps merge src into dst, unmarshalling json.RawMessages when necessary
 func mergeMaps(dst, src map[string]interface{}) {
 	for k, v := range dst {
 		if b, ok := src[k]; ok {
@@ -614,7 +677,7 @@ func mergeMaps(dst, src map[string]interface{}) {
 			case map[string]interface{}:
 				aValue = value
 			default:
-				panic("invalid merge")
+				panic(fmt.Sprintf("mergeMaps: dst value is %T not a map[string]interface{} or json.RawMessage", value))
 			}
 
 			switch value := b.(type) {
@@ -625,7 +688,7 @@ func mergeMaps(dst, src map[string]interface{}) {
 			case map[string]interface{}:
 				bValue = value
 			default:
-				panic("invalid merge")
+				panic(fmt.Sprintf("mergeMaps: src value is %T not a map[string]interface{} or json.RawMessage", value))
 			}
 
 			mergeMaps(aValue, bValue)

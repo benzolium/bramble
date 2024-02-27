@@ -1,6 +1,7 @@
 package bramble
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var Version = "dev"
@@ -21,23 +24,36 @@ type PluginConfig struct {
 	Config json.RawMessage
 }
 
+type TimeoutConfig struct {
+	ReadTimeout          string        `json:"read"`
+	ReadTimeoutDuration  time.Duration `json:"-"`
+	WriteTimeout         string        `json:"write"`
+	WriteTimeoutDuration time.Duration `json:"-"`
+	IdleTimeout          string        `json:"idle"`
+	IdleTimeoutDuration  time.Duration `json:"-"`
+}
+
 // Config contains the gateway configuration
 type Config struct {
-	IdFieldName            string    `json:"id-field-name"`
-	GatewayListenAddress   string    `json:"gateway-address"`
-	DisableIntrospection   bool      `json:"disable-introspection"`
-	MetricsListenAddress   string    `json:"metrics-address"`
-	PrivateListenAddress   string    `json:"private-address"`
-	GatewayPort            int       `json:"gateway-port"`
-	MetricsPort            int       `json:"metrics-port"`
-	PrivatePort            int       `json:"private-port"`
-	Services               []string  `json:"services"`
-	LogLevel               log.Level `json:"loglevel"`
-	PollInterval           string    `json:"poll-interval"`
+	IdFieldName            string        `json:"id-field-name"`
+	GatewayListenAddress   string        `json:"gateway-address"`
+	DisableIntrospection   bool          `json:"disable-introspection"`
+	MetricsListenAddress   string        `json:"metrics-address"`
+	PrivateListenAddress   string        `json:"private-address"`
+	GatewayPort            int           `json:"gateway-port"`
+	MetricsPort            int           `json:"metrics-port"`
+	PrivatePort            int           `json:"private-port"`
+	DefaultTimeouts        TimeoutConfig `json:"default-timeouts"`
+	GatewayTimeouts        TimeoutConfig `json:"gateway-timeouts"`
+	PrivateTimeouts        TimeoutConfig `json:"private-timeouts"`
+	Services               []string      `json:"services"`
+	LogLevel               log.Level     `json:"loglevel"`
+	PollInterval           string        `json:"poll-interval"`
 	PollIntervalDuration   time.Duration
-	MaxRequestsPerQuery    int64 `json:"max-requests-per-query"`
-	MaxServiceResponseSize int64 `json:"max-service-response-size"`
-	MaxFileUploadSize      int64 `json:"max-file-upload-size"`
+	MaxRequestsPerQuery    int64           `json:"max-requests-per-query"`
+	MaxServiceResponseSize int64           `json:"max-service-response-size"`
+	MaxFileUploadSize      int64           `json:"max-file-upload-size"`
+	Telemetry              TelemetryConfig `json:"telemetry"`
 	Plugins                []PluginConfig
 	// Config extensions that can be shared among plugins
 	Extensions map[string]json.RawMessage
@@ -47,6 +63,7 @@ type Config struct {
 	plugins          []Plugin
 	executableSchema *ExecutableSchema
 	watcher          *fsnotify.Watcher
+	tracer           trace.Tracer
 	configFiles      []string
 	linkedFiles      []string
 }
@@ -117,6 +134,25 @@ func (c *Config) Load() error {
 		return fmt.Errorf("invalid poll interval: %w", err)
 	}
 
+	c.DefaultTimeouts.ReadTimeoutDuration, err = time.ParseDuration(c.DefaultTimeouts.ReadTimeout)
+	if err != nil {
+		return fmt.Errorf("invalid default read timeout: %w", err)
+	}
+	c.DefaultTimeouts.WriteTimeoutDuration, err = time.ParseDuration(c.DefaultTimeouts.WriteTimeout)
+	if err != nil {
+		return fmt.Errorf("invalid default write timeout: %w", err)
+	}
+	c.DefaultTimeouts.IdleTimeoutDuration, err = time.ParseDuration(c.DefaultTimeouts.IdleTimeout)
+	if err != nil {
+		return fmt.Errorf("invalid default idle timeout: %w", err)
+	}
+	if err = c.loadTimeouts(&c.GatewayTimeouts, "gateway", c.DefaultTimeouts); err != nil {
+		return err
+	}
+	if err = c.loadTimeouts(&c.PrivateTimeouts, "private", c.DefaultTimeouts); err != nil {
+		return err
+	}
+
 	services, err := c.buildServiceList()
 	if err != nil {
 		return err
@@ -125,6 +161,38 @@ func (c *Config) Load() error {
 
 	c.plugins = c.ConfigurePlugins()
 
+	return nil
+}
+
+func (c *Config) loadTimeouts(config *TimeoutConfig, name string, defaults TimeoutConfig) error {
+	var err error
+	if config.ReadTimeout != "" {
+		config.ReadTimeoutDuration, err = time.ParseDuration(config.ReadTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid %s read timeout: %w", name, err)
+		}
+	}
+	if config.ReadTimeoutDuration == 0 {
+		config.ReadTimeoutDuration = defaults.ReadTimeoutDuration
+	}
+	if config.WriteTimeout != "" {
+		config.WriteTimeoutDuration, err = time.ParseDuration(config.WriteTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid %s write timeout: %w", name, err)
+		}
+	}
+	if config.WriteTimeoutDuration == 0 {
+		config.WriteTimeoutDuration = defaults.WriteTimeoutDuration
+	}
+	if config.IdleTimeout != "" {
+		config.IdleTimeoutDuration, err = time.ParseDuration(config.IdleTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid %s idle timeout: %w", name, err)
+		}
+	}
+	if config.IdleTimeoutDuration == 0 {
+		config.IdleTimeoutDuration = defaults.IdleTimeoutDuration
+	}
 	return nil
 }
 
@@ -188,18 +256,32 @@ func (c *Config) Watch() {
 				continue
 			}
 
-			err := c.Load()
-			if err != nil {
+			if err := c.reload(); err != nil {
 				log.WithError(err).Error("error reloading config")
 			}
-			log.WithField("services", c.Services).Info("config file updated")
-			err = c.executableSchema.UpdateServiceList(c.Services)
-			if err != nil {
-				log.WithError(err).Error("error updating services")
-			}
-			log.WithField("services", c.Services).Info("updated services")
 		}
 	}
+}
+
+func (c *Config) reload() error {
+	ctx := context.Background()
+
+	ctx, span := c.tracer.Start(ctx, "Config Reload")
+	defer span.End()
+
+	if err := c.Load(); err != nil {
+		log.WithError(err).Error("error reloading config")
+	}
+
+	log.WithField("services", c.Services).Info("config file updated")
+
+	if err := c.executableSchema.UpdateServiceList(ctx, c.Services); err != nil {
+		log.WithError(err).Error("error updating services")
+	}
+
+	log.WithField("services", c.Services).Info("updated services")
+
+	return nil
 }
 
 // GetConfig returns operational config for the gateway
@@ -220,6 +302,11 @@ func GetConfig(configFiles []string) (*Config, error) {
 	}
 
 	cfg := Config{
+		DefaultTimeouts: TimeoutConfig{
+			ReadTimeout:  "5s",
+			WriteTimeout: "10s",
+			IdleTimeout:  "120s",
+		},
 		GatewayPort:            8082,
 		PrivatePort:            8083,
 		MetricsPort:            9009,
@@ -229,6 +316,7 @@ func GetConfig(configFiles []string) (*Config, error) {
 		MaxServiceResponseSize: 1024 * 1024,
 
 		watcher:     watcher,
+		tracer:      otel.GetTracerProvider().Tracer(instrumentationName),
 		configFiles: configFiles,
 		linkedFiles: linkedFiles,
 	}
@@ -264,18 +352,29 @@ func (c *Config) Init() error {
 		return fmt.Errorf("error building service list: %w", err)
 	}
 
-	var services []*Service
-	for _, s := range c.Services {
-		services = append(services, NewService(s))
+	serviceClientOptions := []ClientOpt{
+		WithMaxResponseSize(c.MaxServiceResponseSize),
+	}
+	if c.QueryHTTPClient != nil {
+		serviceClientOptions = append(serviceClientOptions, WithHTTPClient(c.QueryHTTPClient))
 	}
 
-	queryClientOptions := []ClientOpt{WithMaxResponseSize(c.MaxServiceResponseSize), WithUserAgent(GenerateUserAgent("query"))}
+	var services []*Service
+	for _, s := range c.Services {
+		services = append(services, NewService(s, serviceClientOptions...))
+	}
+
+	queryClientOptions := []ClientOpt{
+		WithMaxResponseSize(c.MaxServiceResponseSize),
+		WithUserAgent(GenerateUserAgent("query")),
+	}
+
 	if c.QueryHTTPClient != nil {
 		queryClientOptions = append(queryClientOptions, WithHTTPClient(c.QueryHTTPClient))
 	}
 	queryClient := NewClientWithPlugins(c.plugins, queryClientOptions...)
 	es := NewExecutableSchema(c.plugins, c.MaxRequestsPerQuery, queryClient, services...)
-	err = es.UpdateSchema(true)
+	err = es.UpdateSchema(context.Background(), true)
 	if err != nil {
 		return err
 	}
