@@ -1171,6 +1171,44 @@ func TestBubbleUpNullValuesInPlace(t *testing.T) {
 			}}), errs)
 		require.Equal(t, jsonToInterfaceMap(`{ "critters": [ { "id": "GIZMO1", "color": "RED", "_bramble__typename": "Gizmo"  }, { "id": "GREMLIN1", "name": "Spikey", "_bramble__typename": "Gremlin" }, null ]	}`), result)
 	})
+
+	t.Run("works with null in array", func(t *testing.T) {
+		ddl := `
+		type Gizmo {
+			id: ID!
+			color: String!
+		}
+
+		type Query {
+			gizmos: [Gizmo]!
+		}`
+
+		result := jsonToInterfaceMap(`
+			{
+				"gizmos": [
+					{ "id": "GIZMO1", "color": "RED" },
+					null,
+					{ "id": "GIZMO2", "color": "GREEN" }
+				]
+			}
+		`)
+
+		schema := gqlparser.MustLoadSchema(&ast.Source{Name: "fixture", Input: ddl})
+
+		query := `
+			{
+				gizmos {
+					id
+					color
+				}
+			}`
+
+		document := gqlparser.MustLoadQuery(schema, query)
+		errs, err := bubbleUpNullValuesInPlace(schema, document.Operations[0].SelectionSet, result)
+		require.NoError(t, err)
+		require.Equal(t, []*gqlerror.Error(nil), errs)
+		require.Equal(t, jsonToInterfaceMap(`{ "gizmos": [ { "id": "GIZMO1", "color": "RED" }, null, { "id": "GIZMO2", "color": "GREEN" } ]	}`), result)
+	})
 }
 
 func TestFormatResponseBody(t *testing.T) {
