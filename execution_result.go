@@ -289,7 +289,7 @@ func bubbleUpNullValuesInPlaceRec(schema *ast.Schema, currentType *ast.Type, sel
 		}
 	case nil:
 		if currentType.Elem.NonNull {
-			return nil, false, fmt.Errorf("bubbleUpNullValuesInPlaceRec: unxpected result type '%T'", result)
+			return nil, false, fmt.Errorf("bubbleUpNullValuesInPlaceRec: unxpected result not nullable type '%T'", result)
 		}
 		return
 	default:
