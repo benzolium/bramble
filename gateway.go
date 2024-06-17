@@ -42,9 +42,14 @@ func (g *Gateway) UpdateSchemas(interval time.Duration) {
 func (g *Gateway) Router(cfg *Config) http.Handler {
 	mux := http.NewServeMux()
 
+	gatewayHandler := handler.New(g.ExecutableSchema)
+
+	for _, plugin := range g.plugins {
+		plugin.SetupGatewayHandler(gatewayHandler)
+	}
+
 	// Duplicated from `handler.NewDefaultServer` minus
 	// the websocket transport and persisted query extension
-	gatewayHandler := handler.New(g.ExecutableSchema)
 	gatewayHandler.AddTransport(transport.Options{})
 	gatewayHandler.AddTransport(transport.GET{})
 	gatewayHandler.AddTransport(transport.POST{})
@@ -53,10 +58,6 @@ func (g *Gateway) Router(cfg *Config) http.Handler {
 	})
 	if !cfg.DisableIntrospection {
 		gatewayHandler.Use(extension.Introspection{})
-	}
-
-	for _, plugin := range g.plugins {
-		plugin.SetupGatewayHandler(gatewayHandler)
 	}
 
 	mux.Handle("/query", applyMiddleware(otelhttp.NewHandler(gatewayHandler, "/query"), debugMiddleware))
